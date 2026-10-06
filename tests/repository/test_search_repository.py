@@ -700,8 +700,10 @@ class TestSearchTermPreparation:
         if is_postgres_backend(search_repository):
             pytest.skip("This test is for SQLite FTS5-specific behavior")
 
-        assert search_repository._prepare_search_term('say "hello"') == '"say ""hello"""*'
-        assert search_repository._prepare_search_term("it's working") == '"it\'s working"*'
+        # A caller-quoted word stays a phrase; the other words are AND-joined.
+        assert search_repository._prepare_search_term('say "hello"') == 'say* AND "hello"*'
+        # An apostrophe needs quoting, but only for its own word.
+        assert search_repository._prepare_search_term("it's working") == '"it\'s"* AND working*'
 
     def test_file_paths_no_prefix_wildcard(self, search_repository):
         """File paths should not get prefix wildcards."""
@@ -735,21 +737,46 @@ class TestSearchTermPreparation:
         # This reproduces the bug where "Basic Memory v0.13.0b2" becomes "Basic* AND Memory* AND v0.13.0b2*"
         # which causes FTS5 syntax errors because v0.13.0b2* is not valid FTS5 syntax
         result = search_repository._prepare_search_term("Basic Memory v0.13.0b2")
-        # Should be quoted because of dots in v0.13.0b2
-        assert result == '"Basic Memory v0.13.0b2"*'
+        # Only the dotted token is quoted; quoting the whole query as one phrase
+        # would require the words to be adjacent in the text and return nothing.
+        assert result == 'Basic* AND Memory* AND "v0.13.0b2"*'
 
     def test_mixed_special_characters_in_multi_word_queries(self, search_repository):
         """Multi-word queries with special characters in any word should be fully quoted."""
         if is_postgres_backend(search_repository):
             pytest.skip("This test is for SQLite FTS5-specific behavior")
 
-        # Any word containing special characters should cause the entire phrase to be quoted
-        assert search_repository._prepare_search_term("config.json file") == '"config.json file"*'
+        # Each word containing special characters is quoted on its own; the rest stay bare.
+        assert search_repository._prepare_search_term("config.json file") == '"config.json"* AND file*'
         assert (
             search_repository._prepare_search_term("user@email.com account")
-            == '"user@email.com account"*'
+            == '"user@email.com"* AND account*'
         )
-        assert search_repository._prepare_search_term("node.js and react") == '"node.js and react"*'
+        assert (
+            search_repository._prepare_search_term("node.js and react")
+            == '"node.js"* AND and* AND react*'
+        )
+
+    def test_punctuated_identifiers_with_other_terms(self, search_repository):
+        """Ticket ids, flags and colon tokens next to plain words must not collapse
+        the query into one exact phrase (which returns zero rows)."""
+        if is_postgres_backend(search_repository):
+            pytest.skip("This test is for SQLite FTS5-specific behavior")
+
+        assert search_repository._prepare_search_term("IT-644 cacheability") == '"IT-644"* AND cacheability*'
+        assert (
+            search_repository._prepare_search_term("#344 #336 Dev bundle")
+            == '"#344"* AND "#336"* AND Dev* AND bundle*'
+        )
+        assert search_repository._prepare_search_term("cim --diff acli") == 'cim* AND "--diff"* AND acli*'
+        assert search_repository._prepare_search_term("queue:run") == '"queue:run"*'
+        # A caller-quoted multi-word phrase survives as one phrase.
+        assert (
+            search_repository._prepare_search_term('"Monday never bumps" updated_at')
+            == '"Monday never bumps"* AND updated_at*'
+        )
+        # A single caller-quoted term is not quoted a second time.
+        assert search_repository._prepare_search_term('"mirror-image"') == '"mirror-image"*'
 
     @pytest.mark.asyncio
     async def test_search_with_special_characters_returns_results(self, search_repository):

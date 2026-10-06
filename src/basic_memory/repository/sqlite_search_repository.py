@@ -282,6 +282,11 @@ class SQLiteSearchRepository(SearchRepositoryBase):
 
         term = term.strip()
 
+        # A term the caller already wrapped in double quotes is an explicit FTS5
+        # phrase; leave it alone rather than quoting it a second time.
+        if len(term) > 2 and term.startswith('"') and term.endswith('"') and term.count('"') == 2:
+            return f"{term}*" if is_prefix else term
+
         # Check if term is already a proper wildcard pattern (alphanumeric + *)
         # e.g., "hello*", "test*world" - these should be left alone
         if "*" in term and all(c.isalnum() or c in "*_-" for c in term):
@@ -336,11 +341,13 @@ class SQLiteSearchRepository(SearchRepositoryBase):
 
         if has_problematic or has_spaces_or_special:
             # Handle multi-word queries differently from special character queries
-            if " " in term and not any(c in term for c in problematic_chars):
+            if " " in term and not (term.startswith('"') and term.endswith('"')):
                 # Check if any individual word contains special characters that need quoting
-                words = term.strip().split()
+                # Split on whitespace but keep caller-quoted phrases ("a b") as one unit.
+                words = re.findall(r'"[^"]*"|\S+', term.strip())
+                special_chars = [c for c in needs_quoting_chars if c != " "] + problematic_chars
                 has_special_in_words = any(
-                    any(c in word for c in needs_quoting_chars if c != " ") for word in words
+                    any(c in word for c in special_chars) for word in words
                 )
 
                 if not has_special_in_words:
@@ -353,12 +360,31 @@ class SQLiteSearchRepository(SearchRepositoryBase):
                         prepared_words = words
                     term = " AND ".join(prepared_words)
                 else:
-                    # If any word has special characters, quote the entire phrase
-                    escaped_term = term.replace('"', '""')
-                    if is_prefix and not ("/" in term and term.endswith(".md")):
-                        term = f'"{escaped_term}"*'
-                    else:
-                        term = f'"{escaped_term}"'  # pragma: no cover
+                    # A multi-word query where SOME words carry FTS5-significant
+                    # punctuation (ticket ids like "IT-644", "#344", "queue:run",
+                    # flags like "--diff"). Quoting the whole query as one phrase
+                    # demands the words be adjacent in the text, which turns
+                    # "IT-644 cacheability" into zero rows even though both words
+                    # occur in the target. Quote only the punctuated words, each as
+                    # its own phrase, and AND-join every word so order still does
+                    # not matter.
+                    prepared_words = []
+                    for word in words:
+                        if not word:
+                            continue
+                        if len(word) > 2 and word.startswith('"') and word.endswith('"'):
+                            # Caller-quoted phrase: keep as-is (plus prefix star when asked).
+                            prepared_words.append(f"{word}*" if is_prefix else word)
+                        elif any(c in word for c in special_chars):
+                            escaped_word = word.replace('"', '""')
+                            prepared_words.append(
+                                f'"{escaped_word}"*' if is_prefix else f'"{escaped_word}"'
+                            )
+                        elif is_prefix:
+                            prepared_words.append(f"{word}*")
+                        else:
+                            prepared_words.append(word)
+                    term = " AND ".join(prepared_words)
             else:
                 # For terms with problematic characters or file paths, use exact phrase matching
                 # Escape any existing quotes by doubling them
