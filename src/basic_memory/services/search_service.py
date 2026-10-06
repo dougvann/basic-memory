@@ -36,6 +36,25 @@ from basic_memory.services import FileService
 # We use 6000 characters to leave headroom for other indexed columns and overhead.
 MAX_CONTENT_STEMS_SIZE = 6000
 
+# SQLite FTS5 has no per-row index size limit, so the Postgres-driven cap above
+# silently truncates searchable text for every file larger than it. On a corpus of
+# long-form notes that makes the tail of each large file unsearchable while search
+# still returns results, so the loss is invisible from the outside. Keep the cap for
+# Postgres; lift it for the SQLite backends.
+MAX_CONTENT_STEMS_SIZE_SQLITE = 10_000_000
+
+
+def _max_content_stems_size() -> int:
+    """Return the content_stems cap appropriate to the configured database backend."""
+    try:
+        from basic_memory.config import ConfigManager, DatabaseBackend
+
+        if ConfigManager().config.database_backend == DatabaseBackend.POSTGRES:
+            return MAX_CONTENT_STEMS_SIZE
+    except Exception:  # pragma: no cover - fall back to the conservative cap
+        return MAX_CONTENT_STEMS_SIZE
+    return MAX_CONTENT_STEMS_SIZE_SQLITE
+
 
 @dataclass(frozen=True)
 class PreparedSearchQuery:
@@ -857,9 +876,10 @@ class SearchService:
                 "\n".join(p for p in content_stems if p and p.strip())
             )
 
-            if len(entity_content_stems) > MAX_CONTENT_STEMS_SIZE:  # pragma: no cover
+            max_stems = _max_content_stems_size()
+            if len(entity_content_stems) > max_stems:  # pragma: no cover
                 entity_content_stems = entity_content_stems[
-                    :MAX_CONTENT_STEMS_SIZE
+                    :max_stems
                 ]  # pragma: no cover
 
             rows_to_index.append(
@@ -892,9 +912,10 @@ class SearchService:
                 obs_content_stems = _strip_nul(
                     "\n".join(p for p in self._generate_variants(obs.content) if p and p.strip())
                 )
-                if len(obs_content_stems) > MAX_CONTENT_STEMS_SIZE:  # pragma: no cover
+                max_obs_stems = _max_content_stems_size()
+                if len(obs_content_stems) > max_obs_stems:  # pragma: no cover
                     obs_content_stems = obs_content_stems[
-                        :MAX_CONTENT_STEMS_SIZE
+                        :max_obs_stems
                     ]  # pragma: no cover
                 rows_to_index.append(
                     SearchIndexRow(
